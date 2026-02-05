@@ -1,3 +1,84 @@
+const { 
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    DisconnectReason, 
+    fetchLatestBaileysVersion, 
+    makeCacheableSignalKeyStore, 
+    jidDecode, 
+    proto 
+} = require("@whiskeysockets/baileys")
+
+const pino = require("pino")
+const { Boom } = require("@hapi/boom")
+const readline = require("readline")
+const fs = require("fs")
+const path = require("path")
+
+// --- KONFIGURASI PATH ---
+const configPath = path.join(__dirname, "config.json")
+const prefixPath = path.join(__dirname, "data", "prefix.json")
+const sessionDir = "session"
+
+// --- CEK FOLDER DATA ---
+if (!fs.existsSync(path.join(__dirname, "data"))) {
+    fs.mkdirSync(path.join(__dirname, "data"), { recursive: true })
+}
+
+// --- FUNGSI INPUT CONSOLE ---
+const question = (text) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+    return new Promise(resolve => rl.question(text, ans => {
+        rl.close()
+        resolve(ans)
+    }))
+}
+
+// --- GLOBAL PLUGINS STORE ---
+const plugins = new Map()
+
+// --- FUNGSI LOAD PLUGINS ---
+function loadPlugins(dir = path.join(__dirname, "plugins")) {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    
+    // Reset plugins map saat reload
+    if (dir === path.join(__dirname, "plugins")) plugins.clear()
+
+    const files = fs.readdirSync(dir)
+    for (const file of files) {
+        const fullPath = path.join(dir, file)
+        const stat = fs.statSync(fullPath)
+
+        if (stat.isDirectory()) {
+            loadPlugins(fullPath)
+        } else if (file.endsWith(".js")) {
+            try {
+                delete require.cache[require.resolve(fullPath)]
+                const plugin = require(fullPath)
+                if ((plugin.command || plugin.noPrefix) && typeof plugin.execute === "function") {
+                    const pluginName = plugin.name || file.replace(".js", "")
+                    plugins.set(pluginName, plugin)
+                }
+            } catch (e) {
+                console.error(`❌ [PLUGIN ERROR] ${file}:`, e.message)
+            }
+        }
+    }
+}
+
+// --- DECODE JID ---
+const decodeJid = (jid) => {
+    if (!jid) return jid
+    if (/:\d+@/gi.test(jid)) {
+        let decode = jidDecode(jid) || {}
+        return decode.user && decode.server && decode.user + "@" + decode.server || jid
+    }
+    return jid
+}
+
+// --- ANTI CRASH SYSTEM ---
+process.on('uncaughtException', console.error)
+process.on('unhandledRejection', console.error)
+
 // --- MAIN FUNCTION ---
 async function startBot() {
     console.clear()
@@ -7,8 +88,7 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
     const { version } = await fetchLatestBaileysVersion()
 
-    // 2. LOGIKA INPUT NOMOR HP (DIPINDAHKAN KE ATAS)
-    // Kita cek dulu status registered sebelum membuat socket
+    // 2. LOGIKA INPUT NOMOR HP (FIX PAIRING CODE)
     let phoneNumber = ""
     if (!state.creds.registered) {
         let currentConfig = {}
@@ -18,7 +98,6 @@ async function startBot() {
             currentConfig = { pairingText: "UBOT" }
         }
         
-        // Tanya nomor dulu, baru connect
         const rawPhone = await question(`📱 Masukkan Nomor WA (628xxx) untuk ${currentConfig.pairingText || "UBOT"}: `)
         phoneNumber = rawPhone.trim().replace(/[^0-9]/g, "")
     }
@@ -32,31 +111,26 @@ async function startBot() {
         },
         logger: pino({ level: "silent" }), 
         printQRInTerminal: false,
-        // Browser yang stabil untuk Pairing Code
         browser: ["Ubuntu", "Chrome", "20.0.04"], 
         generateHighQualityLinkPreview: true,
-        // Tambahkan timeout connect lebih lama
         connectTimeoutMs: 60000, 
         getMessage: async (key) => {
             return { conversation: 'hello' }
         }
     })
 
-    // 4. REQUEST PAIRING CODE (JIKA BELUM REGISTERED)
+    // 4. REQUEST PAIRING CODE (Jika nomor sudah diinput)
     if (!sock.authState.creds.registered && phoneNumber) {
         setTimeout(async () => {
             try {
-                // Request code
                 const code = await sock.requestPairingCode(phoneNumber)
-                // Format kode agar mudah dibaca (ABC-DEF)
                 const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code
                 console.log(`\n💬 KODE PAIRING: ${formattedCode}\n`)
             } catch (err) {
                 console.error("❌ Gagal request pairing code:", err.message)
-                // Jika gagal, restart agar user bisa coba lagi
                 process.exit(1) 
             }
-        }, 3000) // Tunggu 3 detik agar socket benar-benar "ready" untuk request
+        }, 3000)
     }
 
     // UPDATE CREDENTIALS
@@ -117,15 +191,12 @@ async function startBot() {
 
     // MESSAGE HANDLER
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
-        // ... (Kode handler kamu tetap sama seperti sebelumnya) ...
-        // Copy paste isi handler message kamu di sini
         if (type !== "notify") return
         const m = messages[0]
         if (!m.message) return
         if (m.key.remoteJid === "status@broadcast") return 
 
         try {
-            // CONFIG LOADER 
             let latestConfig = {}
             try { latestConfig = JSON.parse(fs.readFileSync(configPath)) } catch { return }
 
@@ -159,6 +230,7 @@ async function startBot() {
 
             const isOwner = isMe || senderNumber === mainOwner || allowedUsers.includes(senderNumber)
 
+            // NO PREFIX
             for (const plugin of plugins.values()) {
                 if (plugin.noPrefix && !isCmd) {
                     try {
@@ -167,6 +239,7 @@ async function startBot() {
                 }
             }
 
+            // WITH COMMAND
             if (isCmd) {
                 const plugin = Array.from(plugins.values()).find(p => Array.isArray(p.command) ? p.command.includes(command) : p.command === command)
                 if (plugin) {
@@ -184,3 +257,6 @@ async function startBot() {
         }
     })
 }
+
+// --- JALANKAN BOT ---
+startBot()
